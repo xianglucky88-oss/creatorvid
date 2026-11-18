@@ -28,10 +28,10 @@ class Store:
         import hashlib
         return hashlib.sha256(blob.encode()).hexdigest()[:24]
 
-    def upsert(self, record):
+    def upsert(self, record, identity=None):
         cur = self.con.execute(
             "INSERT OR IGNORE INTO records(content_hash,id,ts,payload) VALUES(?,?,?,?)",
-            (self.hash(record), str(record.get("id", "")),
+            (identity or self.hash(record), str(record.get("id", "")),
              str(record.get("ts", "")), json.dumps(record, ensure_ascii=False)))
         self.con.commit()
         return cur.rowcount > 0

@@ -12,6 +12,7 @@ _ALL = build_rows()
 _extra = []
 _verified_sessions = set()
 _accepted_tokens = set()
+_fixture = {"flaky_n": 0, "flaky_status": 429, "repeat_page": None}
 
 def _data():
     return _ALL + _extra
@@ -22,7 +23,11 @@ def _page_items(page):
 
 @app.get("/items")
 def items(page: int = 1):
-    data = _page_items(page)
+    if _fixture["flaky_n"] > 0:
+        _fixture["flaky_n"] -= 1
+        return Response(status_code=_fixture["flaky_status"])
+    src = page - 1 if _fixture["repeat_page"] == page else page
+    data = _page_items(src)
     if SPEC.fmt == "json":
         return {"items": data, "page": page}
     if SPEC.fmt == "text":
@@ -33,6 +38,35 @@ def items(page: int = 1):
                   + "</tr>" for it in data)
     return Response(content="<html><table><tr>%s</tr>%s</table></html>" % (th, trs),
                     media_type="text/html")
+
+# --------------------------------------------------------------------- #
+# Fixture controls: let tests rehearse duplicate pages, cross-page
+# re-reports, rate limiting, failures and late/arbitrary content.
+# --------------------------------------------------------------------- #
+@app.post("/fixture/reset")
+def fixture_reset():
+    _extra.clear()
+    _verified_sessions.clear()
+    _accepted_tokens.clear()
+    _fixture.update(flaky_n=0, flaky_status=429, repeat_page=None)
+    return {"ok": True, "total": len(_data())}
+
+@app.post("/fixture/inject")
+async def fixture_inject(request: Request):
+    body = await request.json()
+    _extra.extend(body.get("rows", []))
+    return {"ok": True, "total": len(_data())}
+
+@app.post("/fixture/flaky")
+def fixture_flaky(n: int = 1, status: int = 429):
+    _fixture["flaky_n"] = n
+    _fixture["flaky_status"] = status
+    return {"ok": True}
+
+@app.post("/fixture/repeat_page")
+def fixture_repeat_page(page: int = 2):
+    _fixture["repeat_page"] = page
+    return {"ok": True}
 
 @app.get("/refresh")
 def refresh():

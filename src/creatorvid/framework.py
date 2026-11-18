@@ -144,10 +144,29 @@ def content_hash(d):
     return hashlib.sha256(canonical(d).encode()).hexdigest()[:24]
 
 
-def dedup(records):
+def identity(record):
+    """Format-independent identity: the *meaning* of a record.
+
+    Derived kernel annotations never take part in identity, so a rule
+    update cannot duplicate or silently rewrite stored history.  A
+    countable value participates through its canonical form, so "1e6"
+    and 1000000 identify the same content; an anomalous value keeps its
+    raw expression so distinct anomalies stay distinct.
+    """
+    k = importlib.import_module(".kernel", __package__)
+    derived = getattr(k, "OUTPUT_FIELDS", ())
+    proj = {key: val for key, val in record.items() if key not in derived}
+    canon = record.get("value_canonical")
+    if canon is not None:
+        proj["value"] = canon
+    return content_hash(proj)
+
+
+def dedup(records, key=None):
+    key = key or content_hash
     seen, out, dup = set(), [], 0
     for r in records:
-        h = content_hash(r)
+        h = key(r)
         if h in seen:
             dup += 1
             continue
@@ -185,20 +204,23 @@ def run(mode="full", con=None):
     try:
         records, attempts = fetch_all(http)
         norm = [normalize(dict(r)) for r in records]
-        norm, dup_in_batch = dedup(norm)
         norm = _apply_kernel(norm)
+        norm, dup_in_batch = dedup(norm, key=identity)
 
+        # The watermark is a monotonic checkpoint only.  Runs do not
+        # filter by it: content identity already makes re-ingestion
+        # idempotent, and filtering would silently drop late-arriving
+        # content, making the count depend on delivery order.
         wm = store.watermark()
-        if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
-
-        ingested = sum(1 for r in norm if store.upsert(r))
+        ingested = sum(1 for r in norm if store.upsert(r, identity=identity(r)))
         total = store.count()
+        anomalies = sum(1 for r in norm if r.get("value_canonical") is None)
         new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
         if new_wm:
             store.set_watermark(new_wm)
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
                 "duplicates": dup_in_batch, "ingested": ingested, "count": total,
+                "anomalies": anomalies,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
                 "watermark": store.watermark()}
     finally:
@@ -282,10 +304,11 @@ def run_rpa(con=None):
         logged = r.login()
         items = r.collect()
         norm = [normalize(dict(it)) for it in items]
-        norm, dup = dedup(norm)
         norm = _apply_kernel(norm)
-        ingested = sum(1 for x in norm if store.upsert(x))
+        norm, dup = dedup(norm, key=identity)
+        ingested = sum(1 for x in norm if store.upsert(x, identity=identity(x)))
         total = store.count()
+        anomalies = sum(1 for x in norm if x.get("value_canonical") is None)
         created = dedup_submit = 0
         for x in norm[:2]:
             if r.submit(x):
@@ -295,12 +318,12 @@ def run_rpa(con=None):
         for x in norm[:1]:
             if not r.submit(x):
                 dedup_submit += 1
-        wm = max([str(x.get("ts", "")) for x in norm] + [""])
+        wm = max([str(x.get("ts", "")) for x in norm] + [store.watermark() or ""])
         if wm:
             store.set_watermark(wm)
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
-                "ingested": ingested, "count": total,
+                "ingested": ingested, "count": total, "anomalies": anomalies,
                 "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
     finally:
         if own:
